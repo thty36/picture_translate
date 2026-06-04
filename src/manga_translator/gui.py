@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
+import re
+import subprocess
+import sys
+import tempfile
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .models import BatchOptions
-from .pipeline import translate_directory
+from .worker import EVENT_PREFIX
 
 
 OCR_LANGUAGES = {
@@ -39,6 +44,17 @@ ERASE_MODES = {
     "取背景色": "sample",
 }
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+NOISY_WORKER_MARKERS = (
+    "Downloading [",
+    "Processing ",
+    "Connectivity check",
+    "Checking connectivity",
+    "Model files already exist",
+    "Creating model:",
+    "Could not find files for the given pattern",
+)
+
 
 class MangaTranslatorApp(tk.Tk):
     def __init__(self) -> None:
@@ -49,7 +65,11 @@ class MangaTranslatorApp(tk.Tk):
 
         self.events: queue.Queue[dict] = queue.Queue()
         self.worker: threading.Thread | None = None
-        self.stop_event = threading.Event()
+        self.process: subprocess.Popen[str] | None = None
+        self.temp_dir: Path | None = None
+        self.options_file: Path | None = None
+        self.stop_file: Path | None = None
+        self.worker_finished = False
 
         self.input_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
@@ -65,6 +85,7 @@ class MangaTranslatorApp(tk.Tk):
         self.progress_text = tk.StringVar(value="0 / 0")
 
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll_events)
 
     def _build_ui(self) -> None:
@@ -189,7 +210,7 @@ class MangaTranslatorApp(tk.Tk):
             self.font_path.set(file)
 
     def _start(self) -> None:
-        if self.worker and self.worker.is_alive():
+        if self.process is not None and self.process.poll() is None:
             return
 
         try:
@@ -203,7 +224,7 @@ class MangaTranslatorApp(tk.Tk):
         self.progress.configure(value=0, maximum=1)
         self.progress_text.set("0 / 0")
         self.status_text.set("正在启动...")
-        self.stop_event.clear()
+        self.worker_finished = False
         self._set_running(True)
 
         self.worker = threading.Thread(target=self._run_worker, args=(options,), daemon=True)
@@ -243,15 +264,46 @@ class MangaTranslatorApp(tk.Tk):
 
     def _run_worker(self, options: BatchOptions) -> None:
         try:
-            stats = translate_directory(options, progress=self.events.put, stop_event=self.stop_event)
-            self.events.put({"type": "worker_done", "stats": stats.as_dict()})
+            self._prepare_worker_files(options)
+            assert self.options_file is not None
+
+            env = os.environ.copy()
+            src_root = str(Path(__file__).resolve().parents[1])
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = (
+                src_root if not existing_pythonpath else src_root + os.pathsep + existing_pythonpath
+            )
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUNBUFFERED"] = "1"
+
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "manga_translator.worker", str(self.options_file)],
+                cwd=str(Path(__file__).resolve().parents[2]),
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creationflags,
+            )
+
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                self._queue_worker_line(line)
+            return_code = self.process.wait()
+            self.events.put({"type": "process_exited", "returncode": return_code})
         except Exception as exc:
             self.events.put({"type": "fatal", "message": str(exc)})
 
     def _stop(self) -> None:
-        self.stop_event.set()
+        if self.stop_file is not None:
+            self.stop_file.write_text("stop", encoding="utf-8")
         self.status_text.set("正在请求停止，当前图片处理完后会退出。")
         self._append_log("已请求停止。")
+        self.after(15000, self._terminate_if_still_running)
 
     def _open_output(self) -> None:
         directory = self.output_dir.get().strip()
@@ -301,17 +353,36 @@ class MangaTranslatorApp(tk.Tk):
         elif event_type == "done":
             if message:
                 self._append_log(message)
+        elif event_type == "worker_log":
+            if message:
+                self._append_log(message)
         elif event_type == "worker_done":
             stats = event.get("stats", {})
             self.status_text.set(
                 f"完成 {stats.get('completed', 0)}，失败 {stats.get('failed', 0)}，跳过 {stats.get('skipped', 0)}。"
             )
+            self.worker_finished = True
             self._set_running(False)
+            self._cleanup_worker_files()
+        elif event_type == "process_exited":
+            return_code = int(event.get("returncode", 0))
+            if not self.worker_finished and return_code != 0:
+                self.status_text.set("处理进程已退出。")
+                self._append_log(f"处理进程异常退出，退出码：{return_code}")
+                self._set_running(False)
+                self._cleanup_worker_files()
+            elif not self.worker_finished:
+                self.worker_finished = True
+                self.status_text.set("处理进程已结束。")
+                self._set_running(False)
+                self._cleanup_worker_files()
         elif event_type == "fatal":
             self.status_text.set("处理失败。")
             self._append_log(str(message))
             messagebox.showerror("处理失败", str(message))
+            self.worker_finished = True
             self._set_running(False)
+            self._cleanup_worker_files()
 
     def _update_progress(self, event: dict) -> None:
         index = int(event.get("index", 0))
@@ -333,6 +404,72 @@ class MangaTranslatorApp(tk.Tk):
     def _set_running(self, running: bool) -> None:
         self.start_button.configure(state="disabled" if running else "normal")
         self.stop_button.configure(state="normal" if running else "disabled")
+
+    def _prepare_worker_files(self, options: BatchOptions) -> None:
+        self._cleanup_worker_files()
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="manga_translator_"))
+        self.options_file = self.temp_dir / "options.json"
+        self.stop_file = self.temp_dir / "stop"
+        payload = {
+            "input_dir": str(options.input_dir),
+            "output_dir": str(options.output_dir),
+            "ocr_lang": options.ocr_lang,
+            "source_lang": options.source_lang,
+            "target_lang": options.target_lang,
+            "translator": options.translator,
+            "recursive": options.recursive,
+            "overwrite": options.overwrite,
+            "min_confidence": options.min_confidence,
+            "erase_mode": options.erase_mode,
+            "font_path": str(options.font_path) if options.font_path else None,
+            "copy_images_without_text": options.copy_images_without_text,
+            "stop_file": str(self.stop_file),
+        }
+        self.options_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _queue_worker_line(self, line: str) -> None:
+        text = line.strip()
+        if not text:
+            return
+        if text.startswith(EVENT_PREFIX):
+            try:
+                self.events.put(json.loads(text[len(EVENT_PREFIX) :]))
+            except json.JSONDecodeError:
+                self.events.put({"type": "worker_log", "message": "无法解析 worker 进度消息。"})
+            return
+
+        cleaned = ANSI_RE.sub("", text)
+        if cleaned and not any(marker in cleaned for marker in NOISY_WORKER_MARKERS):
+            self.events.put({"type": "worker_log", "message": cleaned[:500]})
+
+    def _terminate_if_still_running(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            self._append_log("停止等待超时，正在结束处理进程。")
+            self.process.terminate()
+
+    def _cleanup_worker_files(self) -> None:
+        for path in (self.options_file, self.stop_file):
+            if path is not None and path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        if self.temp_dir is not None and self.temp_dir.exists():
+            try:
+                self.temp_dir.rmdir()
+            except OSError:
+                pass
+        self.options_file = None
+        self.stop_file = None
+        self.temp_dir = None
+
+    def _on_close(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            if not messagebox.askyesno("仍在处理", "翻译仍在进行，确定要退出并结束处理进程吗？"):
+                return
+            self.process.terminate()
+        self._cleanup_worker_files()
+        self.destroy()
 
 
 def main() -> None:

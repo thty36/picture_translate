@@ -14,6 +14,8 @@ python run_app.py
 
 第一次运行 PaddleOCR 可能会下载模型，耗时会比较久。程序会默认关闭 PaddleOCR 的 MKLDNN 加速，以规避部分 Windows CPU 环境下的 oneDNN 兼容问题。
 
+批量翻译任务会在独立子进程中运行，GUI 主窗口只接收进度消息；即使 OCR 或翻译比较耗时，窗口也应保持可拖动、可停止。
+
 ## 使用方式
 
 1. 点击“选择”选择图片目录。
